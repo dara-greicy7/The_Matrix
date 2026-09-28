@@ -1,0 +1,52 @@
+#!/bin/bash
+# Run the 3D Matrix rain fullscreen, as a screensaver you start yourself.
+#
+#   matrix-screensaver            the interactive 3D rain
+#   matrix-screensaver intense    Resurrections wall + 3D rain
+#   matrix-screensaver --path     print the file:// URLs (e.g. for WebViewScreenSaver on macOS)
+#
+# Opens in a Chromium-family browser in kiosk mode when one is installed (quit
+# with Cmd+Q / Alt+F4), otherwise in Firefox kiosk, otherwise the default browser.
+# Part of https://github.com/dara-greicy7/The_Matrix
+
+set -euo pipefail
+
+WEB="${THE_MATRIX_WEB:-${XDG_DATA_HOME:-$HOME/.local/share}/the-matrix/web}"
+
+case ${1:-3d} in
+  3d)       page="$WEB/matrix-3d.html" ;;
+  intense)  page="$WEB/matrix-3d-intense.html" ;;
+  --path)   echo "file://$WEB/matrix-3d.html"; echo "file://$WEB/matrix-3d-intense.html"; exit 0 ;;
+  -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) echo "usage: matrix-screensaver [3d|intense|--path]" >&2; exit 1 ;;
+esac
+
+[[ -f $page ]] || { echo "missing $page (re-run The_Matrix install.sh)" >&2; exit 1; }
+url="file://$page"
+# A separate profile keeps kiosk mode from taking over an already-open browser.
+profile="${XDG_CACHE_HOME:-$HOME/.cache}/the-matrix/browser-profile"
+mkdir -p "$profile"
+chromium_args=(--kiosk --app="$url" --user-data-dir="$profile" --no-first-run --noerrdialogs
+               --allow-file-access-from-files --autoplay-policy=no-user-gesture-required)
+
+if [[ $(uname -s) == Darwin ]]; then
+  for app in "Google Chrome" "Chromium" "Brave Browser" "Microsoft Edge"; do
+    if [[ -d "/Applications/$app.app" || -d "$HOME/Applications/$app.app" ]]; then
+      exec open -na "$app" --args "${chromium_args[@]}"
+    fi
+  done
+  if [[ -d "/Applications/Firefox.app" ]]; then
+    exec open -na "Firefox" --args --kiosk "$url"
+  fi
+  exec open "$url"   # Safari: press Ctrl+Cmd+F for fullscreen
+fi
+
+for b in chromium chromium-browser google-chrome-stable google-chrome brave-browser brave microsoft-edge-stable; do
+  if command -v "$b" >/dev/null 2>&1; then
+    exec "$b" "${chromium_args[@]}" >/dev/null 2>&1
+  fi
+done
+if command -v firefox >/dev/null 2>&1; then
+  exec firefox --kiosk "$url" >/dev/null 2>&1
+fi
+exec xdg-open "$url"

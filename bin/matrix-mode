@@ -1,0 +1,79 @@
+#!/bin/bash
+# Switch between the Matrix desktop wallpapers without them drawing over each other.
+#
+#   matrix-mode 3d        interactive 3D rain           (asciipaper: matrix-3d.html)
+#   matrix-mode intense   Resurrections wall + 3D rain  (asciipaper: matrix-3d-intense.html)
+#   matrix-mode classic   Omatrix's live Resurrections rain (Omarchy only; switches to the omatrix theme)
+#   matrix-mode off       stop the asciipaper wallpaper
+#   matrix-mode status    show what is running
+#
+# Only one of them runs at a time. Nothing is deleted; each mode just turns the
+# others off. Part of https://github.com/dara-greicy7/The_Matrix
+
+set -euo pipefail
+
+WALLS="${XDG_DATA_HOME:-$HOME/.local/share}/asciipaper/user-wallpapers"
+LIVE_DIR="$HOME/.config/omarchy/backgrounds/omatrix"
+CLASSIC_BG="$LIVE_DIR/02-resurrections.live.webp"
+STATE="$HOME/.local/state/omarchy/current"
+ASCIIPAPER="$HOME/.local/bin/asciipaper"
+
+omarchy_present() { command -v omarchy >/dev/null 2>&1; }
+current_bg() { readlink -f "$STATE/background" 2>/dev/null || true; }
+
+# A live omatrix background puts a rain layer above asciipaper; swap it for the
+# theme's first still image.
+leave_live_background() {
+  omarchy_present || return 0
+  if [[ $(current_bg) == *.live.* ]]; then
+    local still
+    still=$(find "$STATE/theme/backgrounds" -maxdepth 1 -type f ! -name '*.live.*' 2>/dev/null | sort | head -n1)
+    [[ -n $still ]] && omarchy theme bg set "$still" >/dev/null
+  fi
+}
+
+run_asciipaper() {
+  [[ -x $ASCIIPAPER ]] || { echo "asciipaper is not installed (run The_Matrix install.sh)." >&2; exit 1; }
+  [[ -f $WALLS/$1 ]] || { echo "missing $WALLS/$1 (re-run The_Matrix install.sh)." >&2; exit 1; }
+  leave_live_background
+  systemctl --user enable -q asciipaper.service
+  "$ASCIIPAPER" set "$WALLS/$1" >/dev/null
+  systemctl --user restart asciipaper.service   # also puts it back above the compositor's wallpaper
+}
+
+case ${1:-status} in
+  3d)
+    run_asciipaper matrix-3d.html
+    echo "Matrix 3D on."
+    ;;
+  intense)
+    run_asciipaper matrix-3d-intense.html
+    echo "Matrix 3D Intense on."
+    ;;
+  classic)
+    omarchy_present || { echo "classic needs Omarchy (the omatrix theme)." >&2; exit 1; }
+    [[ -f $CLASSIC_BG ]] || { echo "Omatrix live backgrounds are not installed." >&2; exit 1; }
+    systemctl --user disable -q --now asciipaper.service 2>/dev/null || true
+    [[ $(cat "$STATE/theme.name" 2>/dev/null) == omatrix ]] || omarchy theme set omatrix >/dev/null 2>&1
+    omarchy theme bg set "$CLASSIC_BG" >/dev/null
+    echo "Matrix Classic (Omatrix Resurrections live rain) on."
+    ;;
+  off)
+    systemctl --user disable -q --now asciipaper.service 2>/dev/null || true
+    echo "Matrix wallpaper off."
+    ;;
+  status)
+    if systemctl --user is-active -q asciipaper.service 2>/dev/null; then
+      echo "asciipaper: $(cat "${XDG_CONFIG_HOME:-$HOME/.config}/asciipaper/wallpaper" 2>/dev/null)"
+    else
+      echo "asciipaper: off"
+    fi
+    if omarchy_present; then
+      echo "theme: $(cat "$STATE/theme.name" 2>/dev/null)   background: $(basename "$(current_bg)")"
+    fi
+    ;;
+  *)
+    sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+    ;;
+esac

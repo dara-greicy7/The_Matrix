@@ -1,0 +1,469 @@
+<!doctype html>
+<!--
+  matrix-3d-intense: the Matrix Resurrections rain (a WebGL port of the
+  Rezmason/matrix "resurrections" version, MIT, via leandrolalanne/matrix-rain)
+  as a back wall, with denser volumetric 3D rain flying in front of it, both
+  run through the same bloom and palette.
+
+  Move the cursor   the camera turns toward it; the back wall pans with depth.
+  Click             the 3D rain turns toward the click (centre = straight at
+                    you), and a ripple rings out across both layers.
+  Double-click      3D rain back to falling straight down.
+  Scroll            3D rain speed.
+
+  Plain WebGL2, no network. The glyph atlas is embedded below.
+  Generated from matrix-3d-intense.template.html by tools/build-intense.py.
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<title>Matrix 3D Intense</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+
+const CFG = {
+  // back wall (Resurrections)
+  cellHeight: 22,          // CSS px per glyph row
+  cellAspect: 0.72,
+  fallSpeed: 0.42,
+  raindropLength: 0.75,
+  baseContrast: 1.17,
+  baseBrightness: -0.62,
+  cyclesPerSecond: 1.8,
+  glyphSequenceLength: 135,
+  atlasGrid: [13, 12],
+  glyphEdgeCrop: 0.1,
+  wallPan: 0.06,           // how far the wall slides with the camera
+  wallDim: 0.85,
+
+  // 3D rain in front
+  streams: 2600,
+  trail: 30,
+  spacing: 0.6,
+  box: 64,
+  glyphSize: 0.55,
+  speed: 13,
+  maxYaw: 1.05,
+  maxPitch: 0.7,
+  lookEase: 3.2,
+  turnEase: 1.6,
+  fov: 72,
+  rain3d: 0.95,            // brightness of the 3D layer
+
+  // glow and colour (Resurrections palette)
+  bloomSize: 0.4,
+  bloomStrength: 0.95,
+  cursorIntensity: 2.2,
+  cursor: [0.6992, 1.0, 0.6],
+  palette: [[0.0, 0.0, 0.0, 0.00], [0.2, 1.0, 0.4, 0.92], [1.0, 1.0, 1.0, 1.00], [1.0, 1.0, 1.0, 1.00]],
+};
+
+const canvas = document.getElementById("c");
+const gl = canvas.getContext("webgl2", { antialias: false, alpha: false });
+if (!gl) {
+  document.body.innerHTML = '<p style="color:#3f6;font:16px monospace;padding:2em">WebGL2 unavailable</p>';
+  throw new Error("WebGL2 unavailable");
+}
+const HALF_FLOAT = !!gl.getExtension("EXT_color_buffer_float");
+
+// ---- GL helpers -------------------------------------------------------------
+function compile(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src); gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh) + "\n" + src.slice(0, 200));
+  return sh;
+}
+function program(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const u = {}, n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) { const name = gl.getActiveUniform(p, i).name.replace(/\[0\]$/, ""); u[name] = gl.getUniformLocation(p, name); }
+  return { p, u };
+}
+function target(w, h) {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, HALF_FLOAT ? gl.RGBA16F : gl.RGBA8, w, h, 0, gl.RGBA, HALF_FLOAT ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  const fb = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  return { tex, fb, w, h };
+}
+function bindTex(unit, tex) { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, tex); }
+function drawTo(t) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, t ? t.fb : null);
+  gl.viewport(0, 0, t ? t.w : canvas.width, t ? t.h : canvas.height);
+}
+
+const FULL_VS = `#version 300 es
+out vec2 v_uv;
+void main() {
+  vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+  v_uv = p;
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+const fullscreen = () => gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+// ---- Pass 1: the Resurrections wall (ported from matrix-rain's rain.frag) ----
+const WALL = program(FULL_VS, `#version 300 es
+precision highp float;
+in vec2 v_uv;
+out vec4 o;
+uniform sampler2D u_msdf;
+uniform vec2 u_res, u_msdfSize, u_atlasGrid, u_pan, u_click;
+uniform float u_time, u_cellHeight, u_cellAspect, u_fallSpeed, u_dropLen, u_contrast, u_brightness,
+              u_cycles, u_seqLen, u_crop, u_clickAge, u_dim;
+#define PI 3.14159265359
+float randomFloat(vec2 uv) { float dt = dot(uv, vec2(12.9898, 78.233)), sn = mod(dt, PI); return fract(sin(sn) * 43758.5453); }
+float wobble(float x) { return x + 0.3 * sin(1.4142135623730951 * x) + 0.2 * sin(2.23606797749979 * x); }
+float median3(vec3 i) { return max(min(i.r, i.g), min(max(i.r, i.g), i.b)); }
+float rainAt(float t, vec2 g) {
+  float off = randomFloat(vec2(g.x, 0.0)) * 1000.0;
+  float spd = randomFloat(vec2(g.x + 0.1, 0.0)) * 0.5 + 0.5;
+  float rt = (g.y * 0.01 + off + t * u_fallSpeed * spd) / u_dropLen;
+  return 1.0 - fract(wobble(rt));
+}
+float symbolAt(float t, vec2 sp) {
+  float age0 = randomFloat(sp + 0.5);
+  float k = floor(age0 + u_cycles * t);
+  if (k < 1.0) return floor(u_seqLen * randomFloat(sp));
+  return floor(u_seqLen * randomFloat(sp + (k - age0) / u_cycles));
+}
+void main() {
+  vec2 uv = v_uv + u_pan;                      // slides with the camera
+  vec2 cellPx = vec2(u_cellHeight * u_cellAspect, u_cellHeight);
+  vec2 grid = max(vec2(1.0), u_res / cellPx);
+  vec2 gp = floor(uv * grid), sp = gp / grid;
+  float r = rainAt(u_time, gp), rb = rainAt(u_time, gp + vec2(0.0, -1.0));
+  bool cursor = r > rb;
+  float base = r * u_contrast + u_brightness;
+
+  // Ripple ringing out from the last click.
+  vec2 d = (v_uv - u_click) * vec2(u_res.x / u_res.y, 1.0);
+  float ring = length(d) - u_clickAge * 0.9;
+  base += step(abs(ring), 0.035) * 0.75 * exp(-u_clickAge * 0.8);
+
+  float idx = symbolAt(u_time, sp);
+  vec2 cuv = (fract(uv * grid) - 0.5) * (1.0 - u_crop) + 0.5;
+  float sx = mod(idx, u_atlasGrid.x), sy = u_atlasGrid.y - floor((idx - sx) / u_atlasGrid.x) - 1.0;
+  vec2 auv = (cuv + vec2(sx, sy)) / u_atlasGrid;
+  vec2 unitRange = vec2(4.0) / u_msdfSize;
+  float pxRange = max(0.5 * dot(unitRange, 1.0 / fwidth(auv)), 1.0);
+  float glyph = clamp(pxRange * (median3(texture(u_msdf, auv).rgb) - 0.5) + 0.5, 0.0, 1.0);
+  base = max(base, 0.0) * u_dim;
+  o = vec4(cursor ? 0.0 : base * glyph, cursor ? base * glyph : 0.0, 0.0, 1.0);
+}`);
+
+// ---- Pass 2: volumetric 3D rain, drawn additively into the same buffer ----
+const RAIN = program(`#version 300 es
+precision highp float;
+precision highp int;
+uniform sampler2D u_streams;
+uniform mat4 u_view, u_proj;
+uniform vec3 u_dir, u_clickRay;
+uniform float u_time, u_spacing, u_size, u_radius, u_clickAge;
+uniform int u_trail;
+out vec2 v_uv;
+out float v_bright, v_head, v_ring;
+float hash(float n) { return fract(sin(n) * 43758.5453123); }
+void main() {
+  int stream = gl_InstanceID / u_trail, idx = gl_InstanceID - stream * u_trail;
+  vec4 s = texelFetch(u_streams, ivec2(stream % 1024, stream / 1024), 0);
+  float seed = s.w;
+  float len = floor(float(u_trail) * (0.35 + 0.65 * hash(seed * 7.13)));
+  vec2 corner = vec2(gl_VertexID & 1, gl_VertexID >> 1);
+  if (float(idx) >= len) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); v_bright = 0.0; v_uv = corner; return; }
+  vec3 world = s.xyz - u_dir * float(idx) * u_spacing;
+  vec4 eye = u_view * vec4(world, 1.0);
+  float dist = length(eye.xyz);
+  eye.xy += (corner - 0.5) * u_size;
+  gl_Position = u_proj * eye;
+  float rate = idx == 0 ? 16.0 : 0.6 + 3.0 * hash(seed + float(idx) * 1.7);
+  float g = floor(hash(seed * 3.1 + float(idx) * 11.3 + floor(u_time * rate + hash(seed + float(idx))) * 0.37) * 64.0);
+  v_uv = (vec2(mod(g, 8.0), floor(g / 8.0)) + vec2(corner.x, 1.0 - corner.y)) / 8.0;
+  float t = float(idx) / max(len, 1.0);
+  v_bright = pow(1.0 - t, 1.4) * smoothstep(u_radius, u_radius * 0.35, dist) * smoothstep(0.6, 2.5, dist);
+  v_head = idx == 0 ? 1.0 : 0.0;
+  float ang = acos(clamp(dot(normalize(world), u_clickRay), -1.0, 1.0));
+  v_ring = exp(-pow((ang - u_clickAge * 1.4) * 9.0, 2.0)) * exp(-u_clickAge * 1.1);
+}`, `#version 300 es
+precision mediump float;
+uniform sampler2D u_atlas;
+uniform float u_gain;
+in vec2 v_uv;
+in float v_bright, v_head, v_ring;
+out vec4 o;
+void main() {
+  float m = texture(u_atlas, v_uv).r;
+  float b = (v_bright + v_ring * v_bright * 3.0) * m * u_gain;
+  o = vec4(b * (1.0 - v_head), b * v_head * 1.2, 0.0, 1.0);   // r = trail, g = head (cursor colour)
+}`);
+
+// ---- Pass 3: bloom (downsample + separable blur pyramid, upstream weights) ----
+const BLUR = program(FULL_VS, `#version 300 es
+precision mediump float;
+in vec2 v_uv; out vec4 o;
+uniform sampler2D u_src; uniform vec2 u_step;
+void main() {
+  o = vec4((texture(u_src, v_uv) * 0.442 + (texture(u_src, v_uv + u_step) + texture(u_src, v_uv - u_step)) * 0.279).rgb, 1.0);
+}`);
+
+// ---- Pass 4: combine bloom, then brightness -> Resurrections palette ----
+const FINAL = program(FULL_VS, `#version 300 es
+precision highp float;
+in vec2 v_uv; out vec4 o;
+uniform sampler2D u_rain, u_b0, u_b1, u_b2, u_b3, u_b4;
+uniform float u_strength, u_cursorIntensity, u_time;
+uniform vec3 u_cursor;
+uniform vec4 u_pal[4];
+vec3 palette(float b) {
+  vec3 c = u_pal[0].rgb;
+  for (int i = 1; i < 4; i++) c = mix(c, u_pal[i].rgb, clamp((b - u_pal[i-1].a) / max(u_pal[i].a - u_pal[i-1].a, 1e-4), 0.0, 1.0));
+  return b <= 0.0 ? vec3(0.0) : c;
+}
+void main() {
+  vec4 bloom = texture(u_b0, v_uv) * 0.96549 + texture(u_b1, v_uv) * 0.92832 + texture(u_b2, v_uv) * 0.88790
+             + texture(u_b3, v_uv) * 0.84343 + texture(u_b4, v_uv) * 0.79370;
+  vec4 b = texture(u_rain, v_uv) + bloom * u_strength;
+  b -= fract(sin(dot(gl_FragCoord.xy + u_time, vec2(12.9898, 78.233))) * 43758.5453) * 0.02;
+  vec3 c = palette(b.r) + min(u_cursor * u_cursorIntensity * b.g, vec3(1.0));
+  o = vec4(c, 1.0);
+}`);
+
+gl.bindVertexArray(gl.createVertexArray());
+
+// ---- Textures: embedded MSDF atlas for the wall, drawn katakana for 3D ----
+const msdf = gl.createTexture();
+let msdfSize = [832, 768], msdfReady = false;
+{
+  const img = new Image();
+  img.onload = () => {
+    gl.bindTexture(gl.TEXTURE_2D, msdf);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    msdfSize = [img.width, img.height]; msdfReady = true;
+  };
+  img.src = "data:image/png;base64,__ATLAS__";
+}
+
+const CHARS = [];
+for (let c = 0xFF66; c <= 0xFF9D; c++) CHARS.push(String.fromCharCode(c));
+"012345789Z:.=*+-<>¦|".split("").forEach(ch => CHARS.push(ch));
+const katakana = gl.createTexture();
+{
+  const N = 8, CELL = 96, cv = document.createElement("canvas");
+  cv.width = cv.height = N * CELL;
+  const g = cv.getContext("2d");
+  g.fillStyle = "#000"; g.fillRect(0, 0, cv.width, cv.height);
+  g.textAlign = "center"; g.textBaseline = "middle";
+  g.font = `${CELL * 0.7}px "Noto Sans Mono CJK JP", "Noto Sans CJK JP", monospace`;
+  for (let i = 0; i < N * N; i++) {
+    g.save();
+    g.translate((i % N) * CELL + CELL / 2, Math.floor(i / N) * CELL + CELL / 2);
+    if (i < 56) g.scale(-1, 1);
+    g.fillStyle = "#fff"; g.fillText(CHARS[i % CHARS.length], 0, 0);
+    g.restore();
+  }
+  const d = g.getImageData(0, 0, cv.width, cv.height).data, r = new Uint8Array(d.length / 4);
+  for (let i = 0; i < r.length; i++) r[i] = d[i * 4];
+  gl.bindTexture(gl.TEXTURE_2D, katakana);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, cv.width, cv.height, 0, gl.RED, gl.UNSIGNED_BYTE, r);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+}
+
+// ---- 3D stream state --------------------------------------------------------
+const S = CFG.streams, TEX_W = Math.min(S, 1024), TEX_H = Math.ceil(S / 1024), half = CFG.box / 2;
+const heads = new Float32Array(TEX_W * TEX_H * 4), speeds = new Float32Array(S);
+for (let i = 0; i < S; i++) {
+  for (let k = 0; k < 3; k++) heads[i * 4 + k] = (Math.random() - 0.5) * CFG.box;
+  heads[i * 4 + 3] = Math.random() * 1000;
+  speeds[i] = 0.45 + Math.random() * 0.9;
+}
+const streamTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, streamTex);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, TEX_W, TEX_H, 0, gl.RGBA, gl.FLOAT, heads);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+
+// ---- Camera and input (same controls as matrix-3d) --------------------------
+const norm = v => { const l = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0] / l, v[1] / l, v[2] / l]; };
+const add = (a, b, k = 1) => [a[0] + b[0] * k, a[1] + b[1] * k, a[2] + b[2] * k];
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+let yaw = 0, pitch = 0, targetYaw = 0, targetPitch = 0, lastMove = 0;
+let dir = [0, -1, 0], targetDir = [0, -1, 0], speedMul = 1;
+let clickRay = [0, 0, -1], clickPos = [0.5, 0.5], clickTime = -100;
+
+function basis(y, p) {
+  const fwd = [Math.sin(y) * Math.cos(p), Math.sin(p), -Math.cos(y) * Math.cos(p)];
+  const right = norm(cross(fwd, [0, 1, 0]));
+  return { fwd, right, up: cross(right, fwd) };
+}
+function rayAt(x, y) {
+  const { fwd, right, up } = basis(yaw, pitch);
+  const t = Math.tan(CFG.fov * Math.PI / 360), a = canvas.width / canvas.height;
+  return norm(add(add(fwd, right, (x * 2 - 1) * t * a), up, (1 - y * 2) * t));
+}
+addEventListener("pointermove", e => {
+  const k = window.asciipaper?.options?.pointer ?? 1;
+  targetYaw = (e.clientX / innerWidth - 0.5) * 2 * CFG.maxYaw * k;
+  targetPitch = (0.5 - e.clientY / innerHeight) * 2 * CFG.maxPitch * k;
+  lastMove = performance.now();
+});
+addEventListener("pointerdown", e => {
+  if (e.button !== 0) return;
+  const x = e.clientX / innerWidth, y = e.clientY / innerHeight;
+  const { fwd, right, up } = basis(yaw, pitch);
+  const dx = (x - 0.5) * 2, dy = (0.5 - y) * 2, r = Math.min(1, Math.hypot(dx, dy));
+  targetDir = norm(add(add(add([0, 0, 0], right, dx), up, dy), fwd, -2.2 * Math.pow(1 - r, 2)));
+  clickRay = rayAt(x, y);
+  clickPos = [x, 1 - y];
+  clickTime = performance.now();
+});
+addEventListener("dblclick", () => { targetDir = [0, -1, 0]; });
+addEventListener("wheel", e => { speedMul = Math.min(4, Math.max(0.15, speedMul * Math.exp(-e.deltaY * 0.0015))); }, { passive: true });
+addEventListener("contextmenu", e => e.preventDefault());
+
+// ---- Render targets ---------------------------------------------------------
+let rainT, levels = [], temps = [], proj;
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.round(innerWidth * dpr);
+  canvas.height = Math.round(innerHeight * dpr);
+  for (const t of [rainT, ...levels, ...temps]) if (t) { gl.deleteTexture(t.tex); gl.deleteFramebuffer(t.fb); }
+  rainT = target(canvas.width, canvas.height);
+  levels = []; temps = [];
+  let w = Math.max(1, Math.floor(canvas.width * CFG.bloomSize)), h = Math.max(1, Math.floor(canvas.height * CFG.bloomSize));
+  for (let i = 0; i < 5; i++) {
+    levels.push(target(w, h)); temps.push(target(w, h));
+    w = Math.max(1, w >> 1); h = Math.max(1, h >> 1);
+  }
+  const f = 1 / Math.tan(CFG.fov * Math.PI / 360), a = canvas.width / canvas.height, n = 0.1, far = 200;
+  proj = [f / a, 0, 0, 0, 0, f, 0, 0, 0, 0, (far + n) / (n - far), -1, 0, 0, 2 * far * n / (n - far), 0];
+}
+addEventListener("resize", resize);
+resize();
+
+function turnToward(a, b, k) {
+  let v = add(a, add(b, a, -1), k);
+  if (Math.hypot(v[0], v[1], v[2]) < 1e-3) v = add(a, cross(a, [0.3, 0.2, 0.9]), k);
+  return norm(v);
+}
+
+let last = performance.now();
+const start = last;
+function frame(now) {
+  const dt = Math.min(0.1, (now - last) / 1000); last = now;
+  const t = (now - start) / 1000, clickAge = (now - clickTime) / 1000;
+  const dpr = window.devicePixelRatio || 1;
+
+  const idle = (now - lastMove) / 1000, sway = Math.min(1, Math.max(0, (idle - 8) / 6));
+  const le = 1 - Math.exp(-dt * CFG.lookEase);
+  yaw += (targetYaw + sway * 0.18 * Math.sin(t * 0.13) - yaw) * le;
+  pitch += (targetPitch + sway * 0.08 * Math.sin(t * 0.09 + 1) - pitch) * le;
+  dir = turnToward(dir, targetDir, 1 - Math.exp(-dt * CFG.turnEase));
+
+  const step = CFG.speed * speedMul * dt;
+  for (let i = 0; i < S; i++) {
+    const o = i * 4, s = speeds[i] * step;
+    for (let k = 0; k < 3; k++) {
+      let v = heads[o + k] + dir[k] * s;
+      if (v > half) v -= CFG.box; else if (v < -half) v += CFG.box;
+      heads[o + k] = v;
+    }
+  }
+
+  // 1. wall
+  drawTo(rainT);
+  gl.disable(gl.BLEND);
+  gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+  if (msdfReady) {
+    gl.useProgram(WALL.p);
+    bindTex(0, msdf);
+    const U = WALL.u;
+    gl.uniform1i(U.u_msdf, 0);
+    gl.uniform2f(U.u_res, canvas.width, canvas.height);
+    gl.uniform2f(U.u_msdfSize, msdfSize[0], msdfSize[1]);
+    gl.uniform2f(U.u_atlasGrid, CFG.atlasGrid[0], CFG.atlasGrid[1]);
+    gl.uniform2f(U.u_pan, yaw * CFG.wallPan, pitch * CFG.wallPan);
+    gl.uniform2f(U.u_click, clickPos[0], clickPos[1]);
+    gl.uniform1f(U.u_time, t);
+    gl.uniform1f(U.u_cellHeight, CFG.cellHeight * dpr);
+    gl.uniform1f(U.u_cellAspect, CFG.cellAspect);
+    gl.uniform1f(U.u_fallSpeed, CFG.fallSpeed);
+    gl.uniform1f(U.u_dropLen, CFG.raindropLength);
+    gl.uniform1f(U.u_contrast, CFG.baseContrast);
+    gl.uniform1f(U.u_brightness, CFG.baseBrightness);
+    gl.uniform1f(U.u_cycles, CFG.cyclesPerSecond);
+    gl.uniform1f(U.u_seqLen, CFG.glyphSequenceLength);
+    gl.uniform1f(U.u_crop, CFG.glyphEdgeCrop);
+    gl.uniform1f(U.u_clickAge, clickAge);
+    gl.uniform1f(U.u_dim, CFG.wallDim);
+    fullscreen();
+  }
+
+  // 2. 3D rain on top, additive
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+  gl.useProgram(RAIN.p);
+  bindTex(1, streamTex);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, TEX_W, TEX_H, gl.RGBA, gl.FLOAT, heads);
+  bindTex(0, katakana);
+  const { fwd, right, up } = basis(yaw, pitch), R = RAIN.u;
+  gl.uniform1i(R.u_atlas, 0); gl.uniform1i(R.u_streams, 1);
+  gl.uniformMatrix4fv(R.u_view, false, [right[0], up[0], -fwd[0], 0, right[1], up[1], -fwd[1], 0, right[2], up[2], -fwd[2], 0, 0, 0, 0, 1]);
+  gl.uniformMatrix4fv(R.u_proj, false, proj);
+  gl.uniform3fv(R.u_dir, dir); gl.uniform3fv(R.u_clickRay, clickRay);
+  gl.uniform1f(R.u_time, t); gl.uniform1f(R.u_spacing, CFG.spacing); gl.uniform1f(R.u_size, CFG.glyphSize);
+  gl.uniform1f(R.u_radius, half * 0.95); gl.uniform1f(R.u_clickAge, clickAge); gl.uniform1f(R.u_gain, CFG.rain3d);
+  gl.uniform1i(R.u_trail, CFG.trail);
+  gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, S * CFG.trail);
+  gl.disable(gl.BLEND);
+
+  // 3. bloom pyramid
+  gl.useProgram(BLUR.p);
+  gl.uniform1i(BLUR.u.u_src, 0);
+  let src = rainT;
+  for (let i = 0; i < 5; i++) {
+    const L = levels[i], T = temps[i];
+    drawTo(T); bindTex(0, src.tex); gl.uniform2f(BLUR.u.u_step, 1 / L.w, 0); fullscreen();
+    drawTo(L); bindTex(0, T.tex);   gl.uniform2f(BLUR.u.u_step, 0, 1 / L.h); fullscreen();
+    src = L;
+  }
+
+  // 4. palette to screen
+  drawTo(null);
+  gl.useProgram(FINAL.p);
+  const F = FINAL.u;
+  bindTex(0, rainT.tex); gl.uniform1i(F.u_rain, 0);
+  for (let i = 0; i < 5; i++) { bindTex(i + 1, levels[i].tex); gl.uniform1i(F["u_b" + i], i + 1); }
+  gl.uniform1f(F.u_strength, CFG.bloomStrength);
+  gl.uniform1f(F.u_cursorIntensity, CFG.cursorIntensity);
+  gl.uniform1f(F.u_time, t);
+  gl.uniform3fv(F.u_cursor, CFG.cursor);
+  gl.uniform4fv(F.u_pal, CFG.palette.flat());
+  fullscreen();
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

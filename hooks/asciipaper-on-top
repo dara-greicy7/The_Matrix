@@ -1,0 +1,5 @@
+#!/bin/bash
+# Theme changes restart Omarchy's wallpaper layer, which then draws over
+# asciipaper. Restart asciipaper afterwards so the 3D rain stays on top.
+systemctl --user is-enabled -q asciipaper.service || exit 0
+( sleep 3; systemctl --user restart asciipaper.service ) >/dev/null 2>&1 &

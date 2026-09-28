@@ -1,0 +1,3 @@
+#!/bin/bash
+# Start or stop the matrix-rain video wallpaper when the theme changes.
+systemctl --user restart matrix-wallpaper.service
